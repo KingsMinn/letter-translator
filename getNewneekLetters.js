@@ -1,6 +1,14 @@
 import { google } from 'googleapis';
 import { GoogleGenAI } from '@google/genai';
 
+function formatDuration(ms) {
+    const h = Math.floor(ms / 3600000);
+    const m = Math.floor((ms % 3600000) / 60000);
+    const s = Math.floor((ms % 60000) / 1000);
+    const mm = ms % 1000;
+    return `${h}h ${m}m ${s}s ${mm}ms`;
+  }
+
 function decodeBase64Url(data){
     if (!data) return '';
     const b64 = data.replace(/-/g, '+').replace(/_/g, '/');
@@ -128,7 +136,7 @@ async function translateToEnglish(text) {
     text,
   ].join('\n');
   const res = await ai.models.generateContent({
-    model: 'gemini-2.5-pro',
+    model: 'gemini-2.5-flash',
     contents: prompt,
     config: { responseMimeType: 'text/plain', temperature: 0.3 },
   });
@@ -145,7 +153,7 @@ async function translateToEnglishHtml(html) {
     html,
   ].join('\n');
   const res = await ai.models.generateContent({
-    model: 'gemini-2.5-pro',
+    model: 'gemini-2.5-flash',
     contents: prompt,
     config: { responseMimeType: 'text/plain', temperature: 0.3 },
   });
@@ -182,7 +190,7 @@ async function translateTeachingHtml(text) {
     text,
   ].join('\n');
   const res = await ai.models.generateContent({
-    model: 'gemini-2.5-pro',
+    model: 'gemini-2.5-flash',
     contents: prompt,
     config: { responseMimeType: 'text/plain', temperature: 0.4 },
   });
@@ -207,7 +215,7 @@ async function translateHtmlEndToEnd(html) {
     html,
   ].join('\n');
   const res = await ai.models.generateContent({
-    model: 'gemini-2.5-pro',
+    model: 'gemini-2.5-flash',
     contents: prompt,
     config: { responseMimeType: 'text/plain', temperature: 0.4 },
   });
@@ -263,7 +271,9 @@ export default async function getNewneekLetters(auth) {
     let totalCandidates = 0;
     let sentCount = 0;
     let skippedCount = 0;
+    const startedTime = new Date;
     console.log('[translator] Start', { hasKey: Boolean(process.env.GEMINI_API_KEY), query: q });
+    console.log('Started', startedTime);
 
     do {
         const res = await gmail.users.messages.list({
@@ -414,6 +424,8 @@ export default async function getNewneekLetters(auth) {
         pageToken = res.data.nextPageToken;
     } while (pageToken);
 
-    console.log('[translator] Done', { pages: page, candidates: totalCandidates, sent: sentCount, skipped: skippedCount });
+    const finishedTime = new Date;
+    const duration = finishedTime - startedTime;
+    console.log('[translator] Done', { duration: formatDuration(duration), pages: page, candidates: totalCandidates, sent: sentCount, skipped: skippedCount });
     return results;
 }
