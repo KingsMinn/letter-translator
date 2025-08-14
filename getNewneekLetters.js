@@ -67,6 +67,22 @@ function extractHeadAndBody(html) {
   return { head, body };
 }
 
+function getHourInZone(ms, timeZone) {
+  try {
+    const fmt = new Intl.DateTimeFormat('en-US', { hour: 'numeric', hour12: false, timeZone });
+    return Number(fmt.format(new Date(ms)));
+  } catch (e) {
+    // Fallback: approximate KST = UTC+9
+    const h = new Date(ms + 9 * 60 * 60 * 1000).getUTCHours();
+    return h;
+  }
+}
+
+function isInKSTMorningWindow(ms) {
+  const hour = getHourInZone(ms, 'Asia/Seoul');
+  return hour >= 5 && hour <= 7; // 05:00 ~ 07:59
+}
+
 function escapeHtml(str) {
     if (!str) return '';
     return str
@@ -131,7 +147,7 @@ async function translateToEnglishHtml(html) {
   const res = await ai.models.generateContent({
     model: 'gemini-2.5-flash',
     contents: prompt,
-    config: { responseMimeType: 'text/html', temperature: 0.3 },
+    config: { responseMimeType: 'text/plain', temperature: 0.3 },
   });
   const out = res.text || '';
   // 번역 실패/미변환으로 판단되면 빈 문자열 반환하여 상위에서 폴백 처리
@@ -168,12 +184,39 @@ async function translateTeachingHtml(text) {
   const res = await ai.models.generateContent({
     model: 'gemini-2.5-flash',
     contents: prompt,
-    config: { responseMimeType: 'text/html', temperature: 0.4 },
+    config: { responseMimeType: 'text/plain', temperature: 0.4 },
   });
   const out = res.text || '';
   if (!out) return '';
   if (koreanRatio(out) > 0.5) return '';
   return out.trim();
+}
+
+async function translateHtmlEndToEnd(html) {
+  const prompt = [
+    'You are a native English teacher. Take the following complete HTML email as input.',
+    'Translate ALL visible Korean text into clear, natural English while PRESERVING the original HTML structure:',
+    '- Keep all tags, nesting, classes, inline styles, images, links, and layout intact.',
+    '- Replace only human‑readable text nodes; do not remove or add unrelated elements.',
+    '- For each article/section, AFTER the translated content, append two subsections:',
+    '  1) <h3>Vocabulary</h3> with a <ul class="vocab-list"> of 5–10 intermediate+ words, each with English–English definition and IPA.',
+    '  2) <h3>Sentence Patterns</h3> with a <ul class="patterns"> of 2–4 key patterns and example sentences.',
+    '- Proper nouns: "뉴닉" → "Newneek", "뉴니커" → "Newneekers".',
+    'Return STRICTLY a valid HTML document starting with <html> and containing <head> and <body>. Do NOT include any explanations or markdown.',
+    '',
+    html,
+  ].join('\n');
+  const res = await ai.models.generateContent({
+    model: 'gemini-2.5-flash',
+    contents: prompt,
+    config: { responseMimeType: 'text/plain', temperature: 0.4 },
+  });
+  const out = res.text || '';
+  // 모델이 text/plain으로 내보내므로, 유효한 HTML 문서로 재래핑
+  if (!out) return '';
+  const { head: headOrig } = extractHeadAndBody(html);
+  const bodySanitized = out; // 신뢰 가정; 필요시 추가 sanitize 가능
+  return `<html><head>${headOrig || ''}</head><body>${bodySanitized}</body></html>`;
 }
 
 function buildMime({ to, from, subject, bodyText, bodyHtml }) {
@@ -208,7 +251,7 @@ export default async function getNewneekLetters(auth) {
     const gmail = google.gmail({ version: 'v1', auth });
 
     // 뉴닉 필터: 도메인 기준 + 최신 몇 시간만 + 안 읽은 메일 우선
-    const q = 'from:newneek.co subject:"🦔" newer_than:1d';
+    const q = 'from:newneek.co newer_than:1d';
 
     // 내 이메일 주소 알아내기 (발송용)
     const profile = await gmail.users.getProfile({ userId: 'me' });
@@ -216,6 +259,11 @@ export default async function getNewneekLetters(auth) {
 
     let pageToken = undefined;
     const results = [];
+    let page = 0;
+    let totalCandidates = 0;
+    let sentCount = 0;
+    let skippedCount = 0;
+    console.log('[translator] Start', { hasKey: Boolean(process.env.GEMINI_API_KEY), query: q });
 
     do {
         const res = await gmail.users.messages.list({
@@ -226,10 +274,12 @@ export default async function getNewneekLetters(auth) {
         });
 
         const ids = (res.data.messages || []).map(m => m.id);
+        console.log(`[translator] Page ${++page}: ids=${ids.length}`);
         if (ids.length === 0) {
             pageToken = res.data.nextPageToken;
             continue;
         }
+        totalCandidates += ids.length;
 
         const details = await Promise.all(
             ids.map(id =>
@@ -245,11 +295,19 @@ export default async function getNewneekLetters(auth) {
             const headers = d.data.payload.headers || [];
             const pick = name => headers.find(h => h.name === name)?.value || '';
             const { textPlain, textHtml } = extractBodies(d.data.payload);
+            // 오전 5~7시(KST) 도착분만 처리
+            const internalDateMs = Number(d.data.internalDate || 0);
+            if (!isInKSTMorningWindow(internalDateMs)) {
+                console.log('[translator] Skip (time window)', d.data.id, new Date(internalDateMs).toISOString());
+                continue;
+            }
             const originalSubject = pick('Subject') || '(No Subject)';
+            console.log('[translator] Candidate', d.data.id, '-', originalSubject);
 
             let bodyText = '';
             let bodyHtml = undefined;
             let translated = '';
+            let shouldSend = true;
 
             if (textHtml) {
                 // 상단: 교사모드(영어) 섹션, 본문: 태그 보존 영어 번역. 한국어 원문은 포함하지 않음
@@ -257,56 +315,54 @@ export default async function getNewneekLetters(auth) {
                 const asText = stripHtml(src);
                 if (process.env.GEMINI_API_KEY) {
                     try {
-                        const teaching = await translateTeachingHtml(asText); // HTML fragment
-                        const translatedBody = await translateToEnglishHtml(src); // HTML body
-                        const safeTeaching = teaching || '';
-                        const safeBodyRaw = translatedBody || `<div class=\"article-body\" style=\"white-space: pre-wrap;\">${escapeHtml(await translateToEnglish(asText)).replace(/\n/g, '<br/>')}</div>`;
-                        const { head: head1, body: body1 } = extractHeadAndBody(safeTeaching);
-                        const { head: head2, body: body2 } = extractHeadAndBody(safeBodyRaw);
-                        const head = [head1, head2].filter(Boolean).join('\n');
-                        const bodyCombined = `${body1}${body2}`;
-                        translated = stripHtml(bodyCombined);
-                        bodyHtml = `<html><head>${head}</head><body>${bodyCombined}</body></html>`;
-                        bodyText = stripHtml(bodyCombined);
+                        // 통째 변환(교사모드 포함). 실패 시 전송하지 않음
+                        const full = await translateHtmlEndToEnd(src);
+                        if (full) {
+                            bodyHtml = full;
+                            translated = stripHtml(full);
+                            bodyText = stripHtml(full);
+                        } else {
+                            console.error('[translator] E2E HTML translation returned empty. Skip send.');
+                            shouldSend = false;
+                        }
                     } catch (e) {
-                        // 폴백: 영어 텍스트만
-                        const t = await translateToEnglish(asText).catch(() => asText);
-                        const simple = `<div class=\"article-body\" style=\"white-space: pre-wrap;\">${escapeHtml(t).replace(/\n/g, '<br/>')}</div>`;
-                        translated = t;
-                        bodyHtml = `<html><body>${simple}</body></html>`;
-                        bodyText = t;
+                        console.error('[translator] E2E HTML translation error. Skip send:', e?.message || e);
+                        shouldSend = false;
                     }
                 } else {
-                    // 키 없음: 처리 불가 → 원문 제외, 빈 본문 방지용 최소 블록
-                    const t = asText;
-                    const simple = `<div class=\"article-body\" style=\"white-space: pre-wrap;\">${escapeHtml(t).replace(/\n/g, '<br/>')}</div>`;
-                    translated = t;
-                    bodyHtml = `<html><body>${simple}</body></html>`;
-                    bodyText = t;
+                    console.error('[translator] GEMINI_API_KEY missing. Skip send for HTML message.');
+                    shouldSend = false;
                 }
             } else {
                 const src = textPlain || d.data.snippet || '';
                 if (process.env.GEMINI_API_KEY) {
                     try {
-                        // 텍스트만 있는 경우: Teaching HTML + 영어 본문 텍스트
-                        let teaching = await translateTeachingHtml(src);
-                        let t = await translateToEnglish(src);
-                        const safeTeaching = teaching || '';
-                        const simpleBody = `<div class=\"article-body\" style=\"white-space: pre-wrap;\">${escapeHtml(t).replace(/\n/g, '<br/>')}</div>`;
-                        translated = t;
-                        bodyHtml = `<html><body>${safeTeaching}${simpleBody}</body></html>`;
-                        bodyText = stripHtml(`${safeTeaching}${simpleBody}`);
+                        // 텍스트만: 교사모드 HTML을 생성하여 완전한 문서로 전송. 실패 시 전송하지 않음
+                        const teachingOnly = await translateTeachingHtml(src);
+                        if (teachingOnly) {
+                            const { head, body } = extractHeadAndBody(teachingOnly);
+                            bodyHtml = `<html><head>${head}</head><body>${body}</body></html>`;
+                            translated = stripHtml(body);
+                            bodyText = translated;
+                        } else {
+                            const t = await translateToEnglish(src);
+                            if (t) {
+                                const simple = `<div class=\"article-body\" style=\"white-space: pre-wrap;\">${escapeHtml(t).replace(/\n/g, '<br/>')}</div>`;
+                                bodyHtml = `<html><body>${simple}</body></html>`;
+                                translated = t;
+                                bodyText = t;
+                            } else {
+                                console.error('[translator] Plain text translation empty. Skip send.');
+                                shouldSend = false;
+                            }
+                        }
                     } catch (e) {
-                        translated = src;
-                        const simple = `<div class=\"article-body\" style=\"white-space: pre-wrap;\">${escapeHtml(translated).replace(/\n/g, '<br/>')}</div>`;
-                        bodyHtml = `<html><body>${simple}</body></html>`;
-                        bodyText = translated;
+                        console.error('[translator] Text translation error. Skip send:', e?.message || e);
+                        shouldSend = false;
                     }
                 } else {
-                    translated = src;
-                    const simple = `<div class=\"article-body\" style=\"white-space: pre-wrap;\">${escapeHtml(translated).replace(/\n/g, '<br/>')}</div>`;
-                    bodyHtml = `<html><body>${simple}</body></html>`;
-                    bodyText = translated;
+                    console.error('[translator] GEMINI_API_KEY missing. Skip send for text message.');
+                    shouldSend = false;
                 }
             }
 
@@ -320,16 +376,27 @@ export default async function getNewneekLetters(auth) {
             }
 
             // 발송 (번역된 본문을 나에게 전송)
-            try {
-                await sendMail(auth, {
-                    to: myEmail,
-                    from: myEmail,
-                    subject: `[NEWNEEK-EN] ${subjectToSend}`,
-                    bodyText,
-                    bodyHtml,
+            if (shouldSend && bodyHtml) {
+                try {
+                    console.log('[translator] Sending', d.data.id, '-', subjectToSend);
+                    await sendMail(auth, {
+                        to: myEmail,
+                        from: myEmail,
+                        subject: `[NEWNEEK-EN] ${subjectToSend}`,
+                        bodyText,
+                        bodyHtml,
+                    });
+                    sentCount += 1;
+                    console.log('[translator] Sent', d.data.id);
+                } catch (e) {
+                    console.error('sendMail failed:', e?.message || e);
+                }
+            } else {
+                console.error('[translator] Skipped send for message:', {
+                    id: d.data.id,
+                    subject: originalSubject,
                 });
-            } catch (e) {
-                console.error('sendMail failed:', e?.message || e);
+                skippedCount += 1;
             }
 
             results.push({
@@ -347,5 +414,6 @@ export default async function getNewneekLetters(auth) {
         pageToken = res.data.nextPageToken;
     } while (pageToken);
 
+    console.log('[translator] Done', { pages: page, candidates: totalCandidates, sent: sentCount, skipped: skippedCount });
     return results;
 }
