@@ -128,7 +128,7 @@ async function translateToEnglish(text) {
     text,
   ].join('\n');
   const res = await ai.models.generateContent({
-    model: 'gemini-2.5-flash',
+    model: 'gemini-2.5-pro',
     contents: prompt,
     config: { responseMimeType: 'text/plain', temperature: 0.3 },
   });
@@ -145,7 +145,7 @@ async function translateToEnglishHtml(html) {
     html,
   ].join('\n');
   const res = await ai.models.generateContent({
-    model: 'gemini-2.5-flash',
+    model: 'gemini-2.5-pro',
     contents: prompt,
     config: { responseMimeType: 'text/plain', temperature: 0.3 },
   });
@@ -182,7 +182,7 @@ async function translateTeachingHtml(text) {
     text,
   ].join('\n');
   const res = await ai.models.generateContent({
-    model: 'gemini-2.5-flash',
+    model: 'gemini-2.5-pro',
     contents: prompt,
     config: { responseMimeType: 'text/plain', temperature: 0.4 },
   });
@@ -207,7 +207,7 @@ async function translateHtmlEndToEnd(html) {
     html,
   ].join('\n');
   const res = await ai.models.generateContent({
-    model: 'gemini-2.5-flash',
+    model: 'gemini-2.5-pro',
     contents: prompt,
     config: { responseMimeType: 'text/plain', temperature: 0.4 },
   });
