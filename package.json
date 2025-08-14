@@ -1,0 +1,26 @@
+{
+  "name": "letter-translator",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KingsMinn/letter-translator.git"
+  },
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/KingsMinn/letter-translator/issues"
+  },
+  "homepage": "https://github.com/KingsMinn/letter-translator#readme",
+  "dependencies": {
+    "@google-cloud/local-auth": "^2.1.0",
+    "@google/genai": "^1.14.0",
+    "dotenv": "^17.2.1",
+    "googleapis": "^105.0.0"
+  }
+}
